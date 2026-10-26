@@ -50,15 +50,15 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 // ============================================================================
 const P = {
   substeps: 10,
-  gravity: -150,             // heavy gel: the stretched neck hangs a little
+  gravity: -80,             // heavy gel: the stretched neck hangs a little
   edgeCompliance: 1.2e-5,   // rubber skin in tension (inverse stiffness)
   edgeStiffening: 40,       // strain stiffening: skin gets much stiffer past ~30% stretch
   maxStrain: 2.2,           // TPR skin locks up rather than locally stretching like it would tear
   compressCompliance: 1.5e-5, // skin is softer in compression (it bunches)
-  bendCompliance: 2e-3,     // skin thickness resists sharp creases
+  bendCompliance: 6e-4,     // skin thickness resists sharp creases
   volumeCompliance: 0,      // gel is incompressible
   inflation: 1.015,        // slightly over-filled: keeps the skin taut so it never dimples
-  shapeRate: 1.5,           // 1/s, slow elastic memory of the sphere
+  shapeRate: 1.5,           // 1/s, slow elastic memory of the cube
   shapeLinear: 0.8,        // fraction of affine stretch the shape memory tolerates
   viscosity: 15,            // 1/s, internal goo: damps relative motion between neighbours
   damping: 0.6,             // 1/s, air drag
@@ -102,6 +102,7 @@ function placeCamera() {
   camera.position.set(0, dist * 0.24, dist);
   camera.lookAt(0, -0.05, 0);
   camera.aspect = a; camera.updateProjectionMatrix();
+  camera.updateMatrixWorld(); // cursor raycasts can run before the next render
 }
 placeCamera();
 
@@ -124,7 +125,7 @@ floor.rotation.x = -Math.PI / 2; floor.position.y = -2.35; floor.receiveShadow =
 scene.add(floor);
 
 // ============================================================================
-// Doh soft body: icosphere skin + incompressible gel (XPBD)
+// Doh soft body: rounded-cube skin + incompressible gel (XPBD)
 // ============================================================================
 function makeIcosphere(sub) {
   const t = (1 + Math.sqrt(5)) / 2, v = [];
@@ -150,6 +151,14 @@ function makeIcosphere(sub) {
 
 const ico = makeIcosphere(4);
 const N = ico.v.length / 3;
+// The Nice Cube shape: push the sphere out onto a superellipsoid |x|^p+|y|^p+|z|^p = R^p,
+// flat faces with soft, pillowy edges and corners
+const CUBE_P = 5, CUBE_R = 0.93, HAND_FIT = 1.0;
+for (let i = 0; i < ico.v.length; i += 3) {
+  const x = ico.v[i], y = ico.v[i+1], z = ico.v[i+2];
+  const s = CUBE_R / Math.pow(Math.abs(x)**CUBE_P + Math.abs(y)**CUBE_P + Math.abs(z)**CUBE_P, 1 / CUBE_P);
+  ico.v[i] = x * s; ico.v[i+1] = y * s; ico.v[i+2] = z * s;
+}
 const X = new Float32Array(ico.v);
 const Xp = new Float32Array(N * 3);
 const Vel = new Float32Array(N * 3);
@@ -191,7 +200,7 @@ const BEND = new Uint32Array(NE * 2), BREST = new Float32Array(NE);
   }
 }
 
-// rest shape for shape matching (Q drifts plastically, Q0 is the factory sphere)
+// rest shape for shape matching (Q drifts plastically, Q0 is the factory cube)
 const Q0 = new Float32Array(X), Q = new Float32Array(X);
 const AqqInv = new THREE.Matrix3(), Aqq0Inv = new THREE.Matrix3();
 function computeAqqInv(q, out) {
@@ -357,22 +366,34 @@ function buildPrims() {
                     { z: -0.12, len: 0.79, r: 0.116 }, { z: -0.35, len: 0.63, r: 0.102 } ];
   for (const f of fingers) {
     const R0 = 1 + f.r, rho = Math.sqrt(R0*R0 - f.z*f.z), a0 = 12 * deg, span = f.len / rho;
-    const ts = [0, 0.42, 0.74, 1], rs = [1.12, 1.0, 0.95, 0.9];
-    const pts = ts.map(t => { const a = a0 + span * t; return [-rho*Math.cos(a), rho*Math.sin(a), f.z]; });
-    for (let s = 0; s < 3; s++) prims.push(capsule(pts[s], pts[s+1], f.r*rs[s], f.r*rs[s+1], 1));
+    // enough joints that each finger can bend smoothly over the cube's rounded edge
+    const K = 7, pts = [], rs = [];
+    for (let k = 0; k < K; k++) { const t = k / (K - 1), a = a0 + span * t; pts.push([-rho*Math.cos(a), rho*Math.sin(a), f.z]); rs.push(f.r * (1.12 - 0.22 * t)); }
+    for (let s = 0; s < K - 1; s++) prims.push(capsule(pts[s], pts[s+1], rs[s], rs[s+1], 1));
   }
   // thumb: wraps the front of the ball
   const td = [[-0.93,-0.30,0.24],[-0.80,-0.24,0.55],[-0.64,-0.14,0.76],[-0.47,-0.06,0.88]];
   const tr = [0.17, 0.145, 0.13, 0.112];
-  const tp = td.map((d, i) => { const l = Math.hypot(...d), R0 = 1 + tr[i]; return d.map(x => x / l * R0); });
-  for (let s = 0; s < 3; s++) prims.push(capsule(tp[s], tp[s+1], tr[s], tr[s+1], s === 0 ? 0.7 : 1));
+  const tp = [], trs = [];
+  for (let s = 0; s < 3; s++) for (let k = 0; k < (s === 2 ? 3 : 2); k++) {
+    const t = k / 2, d = td[s].map((x, i) => x + (td[s+1][i] - x) * t), r = tr[s] + (tr[s+1] - tr[s]) * t;
+    const l = Math.hypot(...d); tp.push(d.map(x => x / l * (1 + r))); trs.push(r);
+  }
+  for (let s = 0; s < tp.length - 1; s++) prims.push(capsule(tp[s], tp[s+1], trs[s], trs[s+1], s < 2 ? 0.7 : 1));
   // wrist: two side-by-side capsules give an oval cross-section
   for (const z of [-0.13, 0.15]) {
     const wa = [pc[0] + v[0]*-0.28 + u[0]*0.05, pc[1] + v[1]*-0.28 + u[1]*0.05, z];
     const wb = [wa[0] + v[0]*-0.5 + u[0]*0.3, wa[1] + v[1]*-0.5 + u[1]*0.3, z * 0.85];
     prims.push(capsule(wa, wb, 0.2, 0.19, 0.1));
   }
-  for (const p of prims) finishPrim(p);
+  // the pose above wraps a unit ball; re-seat every joint at the same height above the cube's
+  // surface instead, so fingers lie along its faces and over its soft edges
+  const snug = v => {
+    const l = Math.hypot(...v), lift = l - HAND_FIT;
+    const d = v.map(x => x / l), rc = CUBE_R / Math.pow(d.reduce((a, x) => a + Math.abs(x) ** CUBE_P, 0), 1 / CUBE_P);
+    for (let i = 0; i < 3; i++) v[i] = d[i] * (rc + lift);
+  };
+  for (const p of prims) { if (p.type === 0) { snug(p.a); snug(p.b); } else { snug(p.c); p.cup = 0.12; } finishPrim(p); }
   return prims;
 }
 function finishPrim(p) {
@@ -694,6 +715,7 @@ function updateContacts(dt = 1 / 60) {
 // Doh rendering + suspended air bubbles
 // ============================================================================
 const GELS = {
+  ice:   { name: 'Ice blue', color: '#3d9cf0', dist: 1.5, swatch: '#7cc0f5' },
   aqua:  { name: 'Aqua',  color: '#38c6d6', dist: 0.95, swatch: '#7fdbe6' },
   clear: { name: 'Clear', color: '#d9ecf5', dist: 2.5,  swatch: '#eef6fa' },
   grape: { name: 'Grape', color: '#9b6bff', dist: 0.8,  swatch: '#b897ff' },
@@ -702,7 +724,7 @@ const GELS = {
 };
 const dohMat = new THREE.MeshPhysicalMaterial({
   color: '#ffffff', roughness: 0.06, metalness: 0, transmission: 1, thickness: 1.6, ior: 1.36,
-  attenuationColor: new THREE.Color(GELS.aqua.color), attenuationDistance: GELS.aqua.dist,
+  attenuationColor: new THREE.Color(GELS.ice.color), attenuationDistance: GELS.ice.dist,
   clearcoat: 1, clearcoatRoughness: 0.08, specularIntensity: 1, envMapIntensity: 1.25,
 });
 const dohGeo = new THREE.BufferGeometry();
@@ -957,7 +979,7 @@ const sw = document.getElementById('swatches');
 for (const [k, g] of Object.entries(GELS)) {
   const b = document.createElement('button');
   b.style.background = g.swatch; b.title = g.name + ' gel'; b.setAttribute('aria-label', g.name + ' gel');
-  if (k === 'aqua') b.classList.add('on');
+  if (k === 'ice') b.classList.add('on');
   b.onclick = () => {
     dohMat.attenuationColor.set(g.color); dohMat.attenuationDistance = g.dist;
     sw.querySelectorAll('button').forEach(x => x.classList.remove('on')); b.classList.add('on');
@@ -980,13 +1002,13 @@ addEventListener('keydown', e => { if (e.key === 't' || e.key === 'T') tuner.sty
 // debug / test hooks
 window.__sim = {
   P, hands, input, X, N,
-  get press() { return press; }, get fps() { return fpsAvg; },
+  get press() { return press; }, get fps() { return fpsAvg; }, get pull() { return pullSmooth; }, get releasing() { return releasing; },
   setCursor(fx, fy, down = false) { // fractions of the viewport, 0..1
     input.ndc.set(fx * 2 - 1, -(fy * 2 - 1)); input.right = fx >= 0.5; input.inside = true; input.down = down;
   },
   reset() {
     X.set(Q0); Q.set(Q0); Vel.fill(0); attachHand.fill(-1); computeAqqInv(Q, AqqInv); smQuat.identity();
-    for (const hd of hands) { hd.pos.set(0, 0, 0); hd.vel.set(0, 0, 0); hd.rot.identity(); hd.prevPos.set(0, 0, 0); hd.prevRot.identity(); hd.force.set(0, 0, 0); hd.setSubstep(1); }
+    for (const hd of hands) { hd.pos.set(0, 0, 0); hd.vel.set(0, 0, 0); hd.rot.identity(); hd.prevPos.set(0, 0, 0); hd.prevRot.identity(); hd.force.set(0, 0, 0); hd.forceAcc.set(0, 0, 0); hd.J.set(0, 0, 0); hd.Jv.set(0, 0, 0); hd.prevVel.set(0, 0, 0); hd.setSubstep(1); }
     resetFist(); releasing = false; fistHold = 1; lastPull = 0; pressPeak = 0;
     pull.set(0, 0, 0); pullSmooth.set(0, 0, 0); input.twist = 0; twistSmooth = 0; input.down = false; press = 0; displacePrims(0);
     updateContacts();

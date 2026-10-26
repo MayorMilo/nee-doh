@@ -1,6 +1,6 @@
 # Nee Doh Simulator
 
-A browser toy: a squishy, gel-filled stress ball hovering in white space, played with by two pink jelly hands. Built with three.js and a custom XPBD soft-body simulation (incompressible gel, strain-stiffening skin, frictional grip, fist-held dough that necks when stretched).
+A browser toy: a squishy, gel-filled rounded cube (like the ice-cube style stress toys) hovering in white space, played with by two pink jelly hands. Built with three.js and a custom XPBD soft-body simulation (incompressible gel, strain-stiffening skin, frictional grip, fist-held dough that necks when stretched).
 
 ## Play
 
