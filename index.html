@@ -1,0 +1,1007 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nee Doh Simulator</title>
+<style>
+  :root { --ink:#24222b; --muted:#9a96a6; --chip:#f3f2f6; }
+  html, body { margin:0; height:100%; background:#ffffff; overflow:hidden;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); }
+  canvas { display:block; touch-action:none; cursor:grab; }
+  canvas.squeezing { cursor:grabbing; }
+  #hud { position:fixed; left:16px; top:14px; user-select:none; pointer-events:none; }
+  #hud h1 { margin:0; font-size:15px; font-weight:650; letter-spacing:.01em; }
+  #hud p { margin:4px 0 0; font-size:12px; color:var(--muted); line-height:1.5; }
+  #lead { position:fixed; left:50%; bottom:16px; transform:translateX(-50%); font-size:11px;
+    color:var(--muted); letter-spacing:.06em; text-transform:uppercase; user-select:none; pointer-events:none; }
+  #swatches { position:fixed; right:16px; top:14px; display:flex; gap:8px; }
+  #swatches button { width:22px; height:22px; border-radius:50%; border:2px solid #fff;
+    box-shadow:0 0 0 1px #0002; cursor:pointer; padding:0; }
+  #swatches button.on { box-shadow:0 0 0 2px var(--ink); }
+  #tuner { position:fixed; right:16px; top:48px; background:#ffffffee; border:1px solid #0001; border-radius:10px;
+    padding:10px 12px; font-size:11px; display:none; max-height:80vh; overflow:auto; }
+  #tuner label { display:grid; grid-template-columns:120px 110px 56px; align-items:center; gap:6px; }
+  #divider { position:fixed; left:50%; top:0; bottom:0; width:1px; background:linear-gradient(#0000, #00000010 30%, #00000010 70%, #0000); pointer-events:none; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="divider"></div>
+<div id="hud">
+  <h1>Nee Doh</h1>
+  <p>Move to pull · Hold to squeeze · Scroll to twist<br>The hand on the cursor's side leads.</p>
+</div>
+<div id="swatches"></div>
+<div id="tuner"></div>
+<div id="lead">Right hand leads</div>
+
+<script type="module">
+import * as THREE from 'three';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// ============================================================================
+// Tunable parameters. Units: 1 world unit = the doh's radius (~3 cm), seconds.
+// ============================================================================
+const P = {
+  substeps: 10,
+  gravity: -150,             // heavy gel: the stretched neck hangs a little
+  edgeCompliance: 1.2e-5,   // rubber skin in tension (inverse stiffness)
+  edgeStiffening: 40,       // strain stiffening: skin gets much stiffer past ~30% stretch
+  maxStrain: 2.2,           // TPR skin locks up rather than locally stretching like it would tear
+  compressCompliance: 1.5e-5, // skin is softer in compression (it bunches)
+  bendCompliance: 2e-3,     // skin thickness resists sharp creases
+  volumeCompliance: 0,      // gel is incompressible
+  inflation: 1.015,        // slightly over-filled: keeps the skin taut so it never dimples
+  shapeRate: 1.5,           // 1/s, slow elastic memory of the sphere
+  shapeLinear: 0.8,        // fraction of affine stretch the shape memory tolerates
+  viscosity: 15,            // 1/s, internal goo: damps relative motion between neighbours
+  damping: 0.6,             // 1/s, air drag
+  gripCompliance: 1e-6,     // finger pad softness
+  slipBase: 0.05,           // how far skin can be dragged under a finger before it slides
+  slipPress: 0.06,          // squeezing grips harder
+  slideRate: 0.5,           // units/s the skin can ooze through the fingers once it slips
+  creep: 0.35, recover: 0.9,// dough-like plastic memory (1/s)
+  pullGain: 0.5, pullMax: 1.55,
+  pressDepth: 0.45,
+  pullClench: 0.5,
+  fistFrom: 0.25, fistTo: 0.7,// how deep into each hand the dough is carried by the fist
+  fistRate: 50,             // 1/s, how firmly the fist holds the dough's shape
+  fistYield: 0.1,          // 1/s, plastic flow of dough out of the fist under tension
+  handYield: 0.02,          // hands are dragged back by the doh's tension
+  handStiff: 5, handReturn: 3, // 1/s, hand spring while pulling out / while easing back
+  anchorRelax: 0.5,         // 1/s, skin under the fingers slowly re-seats (ooze, no stuck strain)
+};
+
+// ============================================================================
+// Renderer / scene
+// ============================================================================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.VSMShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#ffffff');
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.03).texture;
+
+const camera = new THREE.PerspectiveCamera(32, innerWidth / innerHeight, 0.1, 100);
+function placeCamera() {
+  const a = innerWidth / innerHeight, halfH = Math.tan(THREE.MathUtils.degToRad(32) / 2);
+  const dist = Math.max(9.2, 4.3 / (halfH * a));
+  camera.position.set(0, dist * 0.24, dist);
+  camera.lookAt(0, -0.05, 0);
+  camera.aspect = a; camera.updateProjectionMatrix();
+}
+placeCamera();
+
+const key = new THREE.DirectionalLight(0xffffff, 1.6);
+key.position.set(2.5, 9, 4);
+key.castShadow = true;
+key.shadow.mapSize.set(1024, 1024);
+key.shadow.camera.left = -5; key.shadow.camera.right = 5;
+key.shadow.camera.top = 5; key.shadow.camera.bottom = -5;
+key.shadow.camera.near = 1; key.shadow.camera.far = 20;
+key.shadow.radius = 14; key.shadow.blurSamples = 20;
+scene.add(key);
+const rim = new THREE.DirectionalLight(0xffffff, 0.8);
+rim.position.set(-4, 3, -5);
+scene.add(rim);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xe8e4f0, 0.4));
+
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShadowMaterial({ opacity: 0.11 }));
+floor.rotation.x = -Math.PI / 2; floor.position.y = -2.35; floor.receiveShadow = true;
+scene.add(floor);
+
+// ============================================================================
+// Doh soft body: icosphere skin + incompressible gel (XPBD)
+// ============================================================================
+function makeIcosphere(sub) {
+  const t = (1 + Math.sqrt(5)) / 2, v = [];
+  const add = (x, y, z) => { const l = Math.hypot(x, y, z); v.push(x / l, y / l, z / l); return v.length / 3 - 1; };
+  [[-1,t,0],[1,t,0],[-1,-t,0],[1,-t,0],[0,-1,t],[0,1,t],[0,-1,-t],[0,1,-t],[t,0,-1],[t,0,1],[-t,0,-1],[-t,0,1]]
+    .forEach(p => add(...p));
+  let f = [[0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],[1,5,9],[5,11,4],[11,10,2],[10,7,6],[7,1,8],
+           [3,9,4],[3,4,2],[3,2,6],[3,6,8],[3,8,9],[4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1]];
+  for (let s = 0; s < sub; s++) {
+    const cache = new Map();
+    const mid = (a, b) => {
+      const k = a < b ? a * 1e6 + b : b * 1e6 + a;
+      let m = cache.get(k);
+      if (m === undefined) { m = add((v[3*a]+v[3*b])/2, (v[3*a+1]+v[3*b+1])/2, (v[3*a+2]+v[3*b+2])/2); cache.set(k, m); }
+      return m;
+    };
+    const nf = [];
+    for (const [a, b, c] of f) { const ab = mid(a, b), bc = mid(b, c), ca = mid(c, a); nf.push([a,ab,ca],[b,bc,ab],[c,ca,bc],[ab,bc,ca]); }
+    f = nf;
+  }
+  return { v: new Float32Array(v), f: new Uint32Array(f.flat()) };
+}
+
+const ico = makeIcosphere(4);
+const N = ico.v.length / 3;
+const X = new Float32Array(ico.v);
+const Xp = new Float32Array(N * 3);
+const Vel = new Float32Array(N * 3);
+const TRI = ico.f;
+const NT = TRI.length / 3;
+
+function meshVolume() {
+  let vol = 0;
+  for (let t = 0; t < NT; t++) {
+    const a = 3*TRI[3*t], b = 3*TRI[3*t+1], c = 3*TRI[3*t+2];
+    vol += X[a] * (X[b+1]*X[c+2] - X[b+2]*X[c+1]) + X[a+1] * (X[b+2]*X[c] - X[b]*X[c+2]) + X[a+2] * (X[b]*X[c+1] - X[b+1]*X[c]);
+  }
+  return vol / 6;
+}
+if (meshVolume() < 0) for (let t = 0; t < NT; t++) { const s = TRI[3*t+1]; TRI[3*t+1] = TRI[3*t+2]; TRI[3*t+2] = s; }
+const V0 = meshVolume();
+
+// edges + cross-edge "bending" pairs
+const edgeMap = new Map();
+for (let t = 0; t < NT; t++) {
+  const tri = [TRI[3*t], TRI[3*t+1], TRI[3*t+2]];
+  for (let e = 0; e < 3; e++) {
+    const i = tri[e], j = tri[(e+1)%3], o = tri[(e+2)%3];
+    const k = i < j ? i * 1e6 + j : j * 1e6 + i;
+    const en = edgeMap.get(k);
+    if (en) en.o2 = o; else edgeMap.set(k, { i, j, o1: o, o2: -1 });
+  }
+}
+const NE = edgeMap.size;
+const EDGE = new Uint32Array(NE * 2), EREST = new Float32Array(NE);
+const BEND = new Uint32Array(NE * 2), BREST = new Float32Array(NE);
+{
+  let e = 0;
+  const d = (a, b) => Math.hypot(X[3*a]-X[3*b], X[3*a+1]-X[3*b+1], X[3*a+2]-X[3*b+2]);
+  for (const en of edgeMap.values()) {
+    EDGE[2*e] = en.i; EDGE[2*e+1] = en.j; EREST[e] = d(en.i, en.j);
+    BEND[2*e] = en.o1; BEND[2*e+1] = en.o2; BREST[e] = d(en.o1, en.o2);
+    e++;
+  }
+}
+
+// rest shape for shape matching (Q drifts plastically, Q0 is the factory sphere)
+const Q0 = new Float32Array(X), Q = new Float32Array(X);
+const AqqInv = new THREE.Matrix3(), Aqq0Inv = new THREE.Matrix3();
+function computeAqqInv(q, out) {
+  let a00=0,a01=0,a02=0,a11=0,a12=0,a22=0;
+  for (let i = 0; i < N; i++) {
+    const x = q[3*i], y = q[3*i+1], z = q[3*i+2];
+    a00 += x*x; a01 += x*y; a02 += x*z; a11 += y*y; a12 += y*z; a22 += z*z;
+  }
+  out.set(a00,a01,a02, a01,a11,a12, a02,a12,a22).invert();
+}
+computeAqqInv(Q, AqqInv); computeAqqInv(Q0, Aqq0Inv);
+
+const GRAD = new Float32Array(N * 3);
+const smQuat = new THREE.Quaternion();
+const _q = new THREE.Quaternion(), _m4 = new THREE.Matrix4(), _v = new THREE.Vector3();
+const SM = { cx:0, cy:0, cz:0, R: new Float64Array(9), T: new Float64Array(9), A0: new Float64Array(9) };
+
+// Polar decomposition (Müller et al. 2016). A is column-major 3x3.
+function extractRotation(A, q, iters) {
+  for (let it = 0; it < iters; it++) {
+    _m4.makeRotationFromQuaternion(q);
+    const r = _m4.elements;
+    const r0x=r[0],r0y=r[1],r0z=r[2], r1x=r[4],r1y=r[5],r1z=r[6], r2x=r[8],r2y=r[9],r2z=r[10];
+    const wx = (r0y*A[2]-r0z*A[1]) + (r1y*A[5]-r1z*A[4]) + (r2y*A[8]-r2z*A[7]);
+    const wy = (r0z*A[0]-r0x*A[2]) + (r1z*A[3]-r1x*A[5]) + (r2z*A[6]-r2x*A[8]);
+    const wz = (r0x*A[1]-r0y*A[0]) + (r1x*A[4]-r1y*A[3]) + (r2x*A[7]-r2y*A[6]);
+    const den = Math.abs(r0x*A[0]+r0y*A[1]+r0z*A[2] + r1x*A[3]+r1y*A[4]+r1z*A[5] + r2x*A[6]+r2y*A[7]+r2z*A[8]) + 1e-9;
+    const ox = wx/den, oy = wy/den, oz = wz/den, w = Math.hypot(ox, oy, oz);
+    if (w < 1e-9) break;
+    _q.setFromAxisAngle(_v.set(ox/w, oy/w, oz/w), w);
+    q.premultiply(_q).normalize();
+  }
+}
+
+function centroid() {
+  let cx=0,cy=0,cz=0;
+  for (let i = 0; i < N; i++) { cx += X[3*i]; cy += X[3*i+1]; cz += X[3*i+2]; }
+  SM.cx = cx/N; SM.cy = cy/N; SM.cz = cz/N;
+}
+
+// Apq = Σ (x - c) q^T, column-major
+function computeApq(q, A) {
+  A.fill(0);
+  const cx = SM.cx, cy = SM.cy, cz = SM.cz;
+  for (let i = 0; i < N; i++) {
+    const px = X[3*i]-cx, py = X[3*i+1]-cy, pz = X[3*i+2]-cz;
+    const qx = q[3*i], qy = q[3*i+1], qz = q[3*i+2];
+    A[0]+=px*qx; A[1]+=py*qx; A[2]+=pz*qx;
+    A[3]+=px*qy; A[4]+=py*qy; A[5]+=pz*qy;
+    A[6]+=px*qz; A[7]+=py*qz; A[8]+=pz*qz;
+  }
+}
+// out = A * B (column-major, B a THREE.Matrix3 whose .elements are column-major)
+function mul3(A, B, out) {
+  const b = B.elements;
+  for (let c = 0; c < 3; c++) for (let r = 0; r < 3; r++)
+    out[c*3+r] = A[r]*b[c*3] + A[3+r]*b[c*3+1] + A[6+r]*b[c*3+2];
+}
+const _Apq = new Float64Array(9), _Alin = new Float64Array(9);
+
+function shapeMatch(k) {
+  centroid();
+  computeApq(Q, _Apq);
+  extractRotation(_Apq, smQuat, 3);
+  _m4.makeRotationFromQuaternion(smQuat);
+  const r = _m4.elements, R = SM.R;
+  R[0]=r[0];R[1]=r[1];R[2]=r[2];R[3]=r[4];R[4]=r[5];R[5]=r[6];R[6]=r[8];R[7]=r[9];R[8]=r[10];
+  mul3(_Apq, AqqInv, _Alin);
+  const A = _Alin;
+  let det = A[0]*(A[4]*A[8]-A[7]*A[5]) - A[3]*(A[1]*A[8]-A[7]*A[2]) + A[6]*(A[1]*A[5]-A[4]*A[2]);
+  const T = SM.T, b = P.shapeLinear;
+  if (det > 0.05) { const s = 1 / Math.cbrt(det); for (let j = 0; j < 9; j++) T[j] = b*A[j]*s + (1-b)*R[j]; }
+  else for (let j = 0; j < 9; j++) T[j] = R[j];
+  const cx = SM.cx, cy = SM.cy, cz = SM.cz;
+  for (let i = 0; i < N; i++) {
+    const qx = Q[3*i], qy = Q[3*i+1], qz = Q[3*i+2];
+    const gx = cx + T[0]*qx + T[3]*qy + T[6]*qz;
+    const gy = cy + T[1]*qx + T[4]*qy + T[7]*qz;
+    const gz = cz + T[2]*qx + T[5]*qy + T[8]*qz;
+    X[3*i] += (gx - X[3*i]) * k; X[3*i+1] += (gy - X[3*i+1]) * k; X[3*i+2] += (gz - X[3*i+2]) * k;
+  }
+}
+
+function solveEdges(h2) {
+  const aT = P.edgeCompliance / h2, aC = P.compressCompliance / h2, ss = P.edgeStiffening;
+  for (let e = 0; e < NE; e++) {
+    const i = 3*EDGE[2*e], j = 3*EDGE[2*e+1];
+    const dx = X[j]-X[i], dy = X[j+1]-X[i+1], dz = X[j+2]-X[i+2];
+    const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+    if (len < 1e-9) continue;
+    const rest = EREST[e], C = len - rest, strain = C / rest;
+    const a = strain > P.maxStrain ? 0 : strain > 0 ? aT / (1 + ss * strain * strain) : aC;
+    const dl = C / (2 + a) / len;
+    X[i] += dx*dl; X[i+1] += dy*dl; X[i+2] += dz*dl;
+    X[j] -= dx*dl; X[j+1] -= dy*dl; X[j+2] -= dz*dl;
+  }
+}
+// TPR skin simply won't go past its limit: hard length clamp, run last in each substep
+function clampStrain() {
+  const lim = 1 + P.maxStrain;
+  for (let e = 0; e < NE; e++) {
+    const i = 3*EDGE[2*e], j = 3*EDGE[2*e+1];
+    const dx = X[j]-X[i], dy = X[j+1]-X[i+1], dz = X[j+2]-X[i+2];
+    const len = Math.sqrt(dx*dx+dy*dy+dz*dz), max = EREST[e] * lim;
+    if (len <= max) continue;
+    const dl = (len - max) / 2 / len;
+    X[i] += dx*dl; X[i+1] += dy*dl; X[i+2] += dz*dl;
+    X[j] -= dx*dl; X[j+1] -= dy*dl; X[j+2] -= dz*dl;
+  }
+}
+function solveBends(h2) {
+  const a = P.bendCompliance / h2;
+  for (let e = 0; e < NE; e++) {
+    const i = 3*BEND[2*e], j = 3*BEND[2*e+1];
+    const dx = X[j]-X[i], dy = X[j+1]-X[i+1], dz = X[j+2]-X[i+2];
+    const len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+    if (len < 1e-9) continue;
+    const dl = (len - BREST[e]) / (2 + a) / len;
+    X[i] += dx*dl; X[i+1] += dy*dl; X[i+2] += dz*dl;
+    X[j] -= dx*dl; X[j+1] -= dy*dl; X[j+2] -= dz*dl;
+  }
+}
+function solveVolume(h2) {
+  GRAD.fill(0);
+  let vol = 0;
+  for (let t = 0; t < NT; t++) {
+    const a = 3*TRI[3*t], b = 3*TRI[3*t+1], c = 3*TRI[3*t+2];
+    const ax=X[a],ay=X[a+1],az=X[a+2], bx=X[b],by=X[b+1],bz=X[b+2], cx=X[c],cy=X[c+1],cz=X[c+2];
+    const bcx = by*cz-bz*cy, bcy = bz*cx-bx*cz, bcz = bx*cy-by*cx;
+    vol += ax*bcx + ay*bcy + az*bcz;
+    GRAD[a]+=bcx; GRAD[a+1]+=bcy; GRAD[a+2]+=bcz;
+    GRAD[b]+=cy*az-cz*ay; GRAD[b+1]+=cz*ax-cx*az; GRAD[b+2]+=cx*ay-cy*ax;
+    GRAD[c]+=ay*bz-az*by; GRAD[c+1]+=az*bx-ax*bz; GRAD[c+2]+=ax*by-ay*bx;
+  }
+  vol /= 6;
+  let g2 = 0;
+  for (let i = 0; i < 3*N; i++) { GRAD[i] /= 6; g2 += GRAD[i]*GRAD[i]; }
+  const lambda = -(vol - V0 * P.inflation) / (g2 + P.volumeCompliance / h2);
+  for (let i = 0; i < 3*N; i++) X[i] += lambda * GRAD[i];
+}
+function applyViscosity(beta) {
+  const b = beta * 0.5;
+  for (let e = 0; e < NE; e++) {
+    const i = 3*EDGE[2*e], j = 3*EDGE[2*e+1];
+    const rx = (Vel[j]-Vel[i])*b, ry = (Vel[j+1]-Vel[i+1])*b, rz = (Vel[j+2]-Vel[i+2])*b;
+    Vel[i]+=rx; Vel[i+1]+=ry; Vel[i+2]+=rz; Vel[j]-=rx; Vel[j+1]-=ry; Vel[j+2]-=rz;
+  }
+}
+
+// ============================================================================
+// Hands: signed-distance primitives (left hand, in a frame centred on the doh)
+// ============================================================================
+const deg = Math.PI / 180;
+function capsule(a, b, ra, rb, m) { return { type: 0, a, b, ra, rb, m }; }
+function buildPrims() {
+  const prims = [];
+  const pa = -6 * deg;
+  const u = [-Math.cos(pa), Math.sin(pa), 0], v = [Math.sin(pa), Math.cos(pa), 0];
+  const pc = [u[0]*1.15, u[1]*1.15, 0.02];
+  prims.push({ type: 1, c: pc, u, v, hx: 0.02, hy: 0.33, hz: 0.38, round: 0.13, cup: 0.42, m: 0.55 });
+  // fingers: arcs hugging the ball in parallel planes, curling over the top
+  const fingers = [ { z: 0.37, len: 0.74, r: 0.112 }, { z: 0.125, len: 0.84, r: 0.12 },
+                    { z: -0.12, len: 0.79, r: 0.116 }, { z: -0.35, len: 0.63, r: 0.102 } ];
+  for (const f of fingers) {
+    const R0 = 1 + f.r, rho = Math.sqrt(R0*R0 - f.z*f.z), a0 = 12 * deg, span = f.len / rho;
+    const ts = [0, 0.42, 0.74, 1], rs = [1.12, 1.0, 0.95, 0.9];
+    const pts = ts.map(t => { const a = a0 + span * t; return [-rho*Math.cos(a), rho*Math.sin(a), f.z]; });
+    for (let s = 0; s < 3; s++) prims.push(capsule(pts[s], pts[s+1], f.r*rs[s], f.r*rs[s+1], 1));
+  }
+  // thumb: wraps the front of the ball
+  const td = [[-0.93,-0.30,0.24],[-0.80,-0.24,0.55],[-0.64,-0.14,0.76],[-0.47,-0.06,0.88]];
+  const tr = [0.17, 0.145, 0.13, 0.112];
+  const tp = td.map((d, i) => { const l = Math.hypot(...d), R0 = 1 + tr[i]; return d.map(x => x / l * R0); });
+  for (let s = 0; s < 3; s++) prims.push(capsule(tp[s], tp[s+1], tr[s], tr[s+1], s === 0 ? 0.7 : 1));
+  // wrist: two side-by-side capsules give an oval cross-section
+  for (const z of [-0.13, 0.15]) {
+    const wa = [pc[0] + v[0]*-0.28 + u[0]*0.05, pc[1] + v[1]*-0.28 + u[1]*0.05, z];
+    const wb = [wa[0] + v[0]*-0.5 + u[0]*0.3, wa[1] + v[1]*-0.5 + u[1]*0.3, z * 0.85];
+    prims.push(capsule(wa, wb, 0.2, 0.19, 0.1));
+  }
+  for (const p of prims) finishPrim(p);
+  return prims;
+}
+function finishPrim(p) {
+  if (p.type === 0) {
+    p.ba = [p.b[0]-p.a[0], p.b[1]-p.a[1], p.b[2]-p.a[2]];
+    p.bl2 = p.ba[0]**2 + p.ba[1]**2 + p.ba[2]**2 || 1e-9;
+    p.ctr = [(p.a[0]+p.b[0])/2, (p.a[1]+p.b[1])/2, (p.a[2]+p.b[2])/2];
+    p.bound = Math.sqrt(p.bl2)/2 + Math.max(p.ra, p.rb);
+  } else {
+    p.ctr = p.c; p.bound = Math.hypot(p.hx, p.hy, p.hz) + p.round + 0.12;
+  }
+}
+const basePrims = buildPrims();
+const prims = basePrims.map(p => JSON.parse(JSON.stringify(p))); // press-displaced copy
+function displacePrims(dep) {
+  for (let k = 0; k < basePrims.length; k++) {
+    const b = basePrims[k], d = prims[k], s = dep * b.m;
+    const push = (src, dst) => { const l = Math.hypot(...src); for (let i = 0; i < 3; i++) dst[i] = src[i] - src[i] / l * s; };
+    if (b.type === 0) { push(b.a, d.a); push(b.b, d.b); } else push(b.c, d.c);
+    finishPrim(d);
+  }
+}
+function sdPrim(p, x, y, z) {
+  if (p.type === 0) {
+    const ax = x-p.a[0], ay = y-p.a[1], az = z-p.a[2], ba = p.ba;
+    let h = (ax*ba[0] + ay*ba[1] + az*ba[2]) / p.bl2; h = h < 0 ? 0 : h > 1 ? 1 : h;
+    const dx = ax-ba[0]*h, dy = ay-ba[1]*h, dz = az-ba[2]*h;
+    return Math.sqrt(dx*dx+dy*dy+dz*dz) - (p.ra + (p.rb - p.ra) * h);
+  }
+  const dx = x-p.c[0], dy = y-p.c[1], dz = z-p.c[2];
+  let pv = dx*p.v[0] + dy*p.v[1], pw = dz;
+  let pu = dx*p.u[0] + dy*p.u[1] + p.cup * (pv*pv + pw*pw);
+  const qx = Math.abs(pu)-p.hx, qy = Math.abs(pv)-p.hy, qz = Math.abs(pw)-p.hz;
+  const ox = Math.max(qx,0), oy = Math.max(qy,0), oz = Math.max(qz,0);
+  return Math.sqrt(ox*ox+oy*oy+oz*oz) + Math.min(Math.max(qx, qy, qz), 0) - p.round;
+}
+function smin(a, b, k) { const h = Math.max(k - Math.abs(a - b), 0) / k; return Math.min(a, b) - h*h*k*0.25; }
+function sdHandSmooth(list, x, y, z) {
+  let d = 1e9;
+  for (const p of list) {
+    const cx = x-p.ctr[0], cy = y-p.ctr[1], cz = z-p.ctr[2];
+    const far = Math.sqrt(cx*cx+cy*cy+cz*cz) - p.bound;
+    d = smin(d, far > 0.15 ? far : sdPrim(p, x, y, z), 0.07);
+  }
+  return d;
+}
+let nearMask = 0;
+function sdHandCollide(x, y, z) {
+  let d = 1;
+  for (let k = 0; k < prims.length; k++) {
+    const p = prims[k];
+    const cx = x-p.ctr[0], cy = y-p.ctr[1], cz = z-p.ctr[2];
+    if (cx*cx+cy*cy+cz*cz > (p.bound + 0.06) ** 2) continue;
+    const dk = sdPrim(p, x, y, z);
+    if (dk < d) { d = dk; nearMask = p.m; }
+  }
+  return d;
+}
+
+// Naive surface nets mesher for the hand SDF
+function surfaceNets(sdf, mn, mx, h) {
+  const nx = Math.ceil((mx[0]-mn[0])/h)+1, ny = Math.ceil((mx[1]-mn[1])/h)+1, nz = Math.ceil((mx[2]-mn[2])/h)+1;
+  const F = new Float32Array(nx*ny*nz);
+  const id = (i, j, k) => i + nx*(j + ny*k);
+  for (let k = 0; k < nz; k++) for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++)
+    F[id(i,j,k)] = sdf(mn[0]+i*h, mn[1]+j*h, mn[2]+k*h);
+  const cnx = nx-1, cny = ny-1;
+  const cell = new Int32Array(cnx*cny*(nz-1)).fill(-1);
+  const cid = (i, j, k) => i + cnx*(j + cny*k);
+  const E = [];
+  for (let c = 0; c < 8; c++) for (const bit of [1,2,4]) if (!(c & bit)) E.push([c, c|bit]);
+  const pos = [], vals = new Float32Array(8);
+  for (let k = 0; k < nz-1; k++) for (let j = 0; j < ny-1; j++) for (let i = 0; i < nx-1; i++) {
+    let mask = 0;
+    for (let c = 0; c < 8; c++) { const v = F[id(i+(c&1), j+((c>>1)&1), k+((c>>2)&1))]; vals[c] = v; if (v < 0) mask |= 1 << c; }
+    if (mask === 0 || mask === 255) continue;
+    let sx = 0, sy = 0, sz = 0, n = 0;
+    for (const [c0, c1] of E) {
+      if (((mask >> c0) & 1) === ((mask >> c1) & 1)) continue;
+      const t = vals[c0] / (vals[c0] - vals[c1]);
+      sx += (c0&1) + ((c1&1)-(c0&1))*t; sy += ((c0>>1)&1) + (((c1>>1)&1)-((c0>>1)&1))*t; sz += ((c0>>2)&1) + (((c1>>2)&1)-((c0>>2)&1))*t; n++;
+    }
+    cell[cid(i,j,k)] = pos.length / 3;
+    pos.push(mn[0]+(i+sx/n)*h, mn[1]+(j+sy/n)*h, mn[2]+(k+sz/n)*h);
+  }
+  const idx = [];
+  const quad = (a, b, c, d) => { if (a<0||b<0||c<0||d<0) return; idx.push(a,b,c, a,c,d); };
+  for (let k = 1; k < nz-1; k++) for (let j = 1; j < ny-1; j++) for (let i = 1; i < nx-1; i++) {
+    const s0 = F[id(i,j,k)] < 0;
+    if (s0 !== (F[id(i+1,j,k)] < 0)) quad(cell[cid(i,j-1,k-1)], cell[cid(i,j,k-1)], cell[cid(i,j,k)], cell[cid(i,j-1,k)]);
+    if (s0 !== (F[id(i,j+1,k)] < 0)) quad(cell[cid(i-1,j,k-1)], cell[cid(i,j,k-1)], cell[cid(i,j,k)], cell[cid(i-1,j,k)]);
+    if (s0 !== (F[id(i,j,k+1)] < 0)) quad(cell[cid(i-1,j-1,k)], cell[cid(i,j-1,k)], cell[cid(i,j,k)], cell[cid(i-1,j,k)]);
+  }
+  // project onto the surface, compute gradient normals
+  const nrm = new Float32Array(pos.length), e = h * 0.5;
+  const grad = (x, y, z) => {
+    const gx = sdf(x+e,y,z)-sdf(x-e,y,z), gy = sdf(x,y+e,z)-sdf(x,y-e,z), gz = sdf(x,y,z+e)-sdf(x,y,z-e);
+    const l = Math.hypot(gx, gy, gz) || 1; return [gx/l, gy/l, gz/l];
+  };
+  for (let v = 0; v < pos.length; v += 3) {
+    for (let it = 0; it < 2; it++) {
+      const d = sdf(pos[v], pos[v+1], pos[v+2]), g = grad(pos[v], pos[v+1], pos[v+2]);
+      pos[v] -= g[0]*d; pos[v+1] -= g[1]*d; pos[v+2] -= g[2]*d;
+    }
+    const g = grad(pos[v], pos[v+1], pos[v+2]); nrm[v] = g[0]; nrm[v+1] = g[1]; nrm[v+2] = g[2];
+  }
+  // consistent outward winding
+  for (let t = 0; t < idx.length; t += 3) {
+    const a = 3*idx[t], b = 3*idx[t+1], c = 3*idx[t+2];
+    const ux = pos[b]-pos[a], uy = pos[b+1]-pos[a+1], uz = pos[b+2]-pos[a+2];
+    const vx = pos[c]-pos[a], vy = pos[c+1]-pos[a+1], vz = pos[c+2]-pos[a+2];
+    const fx = uy*vz-uz*vy, fy = uz*vx-ux*vz, fz = ux*vy-uy*vx;
+    if (fx*(nrm[a]+nrm[b]+nrm[c]) + fy*(nrm[a+1]+nrm[b+1]+nrm[c+1]) + fz*(nrm[a+2]+nrm[b+2]+nrm[c+2]) < 0) { const s = idx[t+1]; idx[t+1] = idx[t+2]; idx[t+2] = s; }
+  }
+  return { pos: new Float32Array(pos), nrm, idx: new Uint32Array(idx) };
+}
+
+function buildHandGeometry() {
+  let mn = [1e9,1e9,1e9], mx = [-1e9,-1e9,-1e9];
+  for (const p of basePrims) for (let i = 0; i < 3; i++) { mn[i] = Math.min(mn[i], p.ctr[i]-p.bound); mx[i] = Math.max(mx[i], p.ctr[i]+p.bound); }
+  mn = mn.map(v => v - 0.08); mx = mx.map(v => v + 0.08);
+  const net = surfaceNets((x, y, z) => sdHandSmooth(basePrims, x, y, z), mn, mx, 0.024);
+  const nv = net.pos.length / 3;
+  const mask = new Float32Array(nv), jig = new Float32Array(nv);
+  const pc = basePrims[0].c;
+  for (let v = 0; v < nv; v++) {
+    const x = net.pos[3*v], y = net.pos[3*v+1], z = net.pos[3*v+2];
+    let ws = 0, ms = 0;
+    for (const p of basePrims) { const w = Math.exp(-Math.max(sdPrim(p, x, y, z), 0) / 0.04); ws += w; ms += w * p.m; }
+    mask[v] = ms / ws;
+    const d = Math.hypot(x-pc[0], y-pc[1], z-pc[2]);
+    jig[v] = THREE.MathUtils.smoothstep(d, 0.3, 1.3) ** 1.5;
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(net.pos), 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(net.nrm, 3));
+  geo.setIndex(new THREE.BufferAttribute(net.idx, 1));
+  return { geo, base: net.pos, mask, jig };
+}
+const handGeo = buildHandGeometry();
+
+const handMat = new THREE.MeshPhysicalMaterial({
+  color: '#ff9cc2', roughness: 0.16, metalness: 0, transmission: 0.82, thickness: 0.7, ior: 1.42,
+  attenuationColor: new THREE.Color('#ff4f93'), attenuationDistance: 0.55,
+  clearcoat: 1, clearcoatRoughness: 0.12, sheen: 0.4, sheenColor: new THREE.Color('#ffd1e3'), envMapIntensity: 1.1,
+});
+
+class Hand {
+  constructor(side) {
+    this.side = side; // -1 left, +1 right
+    this.pos = new THREE.Vector3(); this.vel = new THREE.Vector3(); this.rot = new THREE.Quaternion();
+    this.prevPos = new THREE.Vector3(); this.prevRot = new THREE.Quaternion(); this.prevVel = new THREE.Vector3();
+    this.ip = new THREE.Vector3(); this.iq = new THREE.Quaternion(); this.m = new Float64Array(9);
+    this.force = new THREE.Vector3(); this.forceAcc = new THREE.Vector3(); this.forceCount = 0;
+    this.J = new THREE.Vector3(); this.Jv = new THREE.Vector3();
+    const geo = handGeo.geo.clone();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(handGeo.base), 3));
+    this.mesh = new THREE.Mesh(geo, handMat);
+    this.mesh.castShadow = true;
+    if (side > 0) this.mesh.scale.set(-1, 1, 1);
+    scene.add(this.mesh);
+    this.setSubstep(1);
+  }
+  setSubstep(t) {
+    this.ip.lerpVectors(this.prevPos, this.pos, t);
+    this.iq.slerpQuaternions(this.prevRot, this.rot, t);
+    const { x, y, z, w } = this.iq, m = this.m; // row-major
+    m[0] = 1-2*(y*y+z*z); m[1] = 2*(x*y-z*w);   m[2] = 2*(x*z+y*w);
+    m[3] = 2*(x*y+z*w);   m[4] = 1-2*(x*x+z*z); m[5] = 2*(y*z-x*w);
+    m[6] = 2*(x*z-y*w);   m[7] = 2*(y*z+x*w);   m[8] = 1-2*(x*x+y*y);
+  }
+}
+const hands = [new Hand(-1), new Hand(1)];
+
+// ---- hand <-> doh contact: collisions + frictional grip -----------------------
+const attachHand = new Int8Array(N).fill(-1);
+const anchor = new Float32Array(N * 3);   // hand-local, un-pressed
+const anchorMask = new Float32Array(N);
+let press = 0;
+const L = [0, 0, 0];
+function toLocal(hd, x, y, z) {
+  const m = hd.m, dx = x - hd.ip.x, dy = y - hd.ip.y, dz = z - hd.ip.z;
+  L[0] = (m[0]*dx + m[3]*dy + m[6]*dz) * -hd.side; // left hand is the template; mirror the right
+  L[1] = m[1]*dx + m[4]*dy + m[7]*dz;
+  L[2] = m[2]*dx + m[5]*dy + m[8]*dz;
+}
+const W = [0, 0, 0];
+function toWorld(hd, lx, ly, lz) {
+  const m = hd.m; lx *= -hd.side;
+  W[0] = hd.ip.x + m[0]*lx + m[1]*ly + m[2]*lz;
+  W[1] = hd.ip.y + m[3]*lx + m[4]*ly + m[5]*lz;
+  W[2] = hd.ip.z + m[6]*lx + m[7]*ly + m[8]*lz;
+}
+
+function solveCollisions() {
+  const e = 0.004;
+  for (const hd of hands) {
+    for (let i = 0; i < N; i++) {
+      toLocal(hd, X[3*i], X[3*i+1], X[3*i+2]);
+      const lx = L[0], ly = L[1], lz = L[2];
+      if (lx > 0.25) continue;
+      const d = sdHandCollide(lx, ly, lz);
+      if (d >= 0) continue;
+      let gx = sdHandCollide(lx+e,ly,lz) - sdHandCollide(lx-e,ly,lz);
+      let gy = sdHandCollide(lx,ly+e,lz) - sdHandCollide(lx,ly-e,lz);
+      let gz = sdHandCollide(lx,ly,lz+e) - sdHandCollide(lx,ly,lz-e);
+      const gl = Math.hypot(gx, gy, gz) || 1;
+      toWorld(hd, lx - gx/gl*d, ly - gy/gl*d, lz - gz/gl*d);
+      X[3*i] = W[0]; X[3*i+1] = W[1]; X[3*i+2] = W[2];
+    }
+  }
+}
+
+function solveGrip(h2, last) {
+  const a = P.gripCompliance / h2, slip = P.slipBase + P.slipPress * press, dep = P.pressDepth * press;
+  const slideStep = P.slideRate * (1 - 0.7 * press) * Math.sqrt(h2);
+  for (let i = 0; i < N; i++) {
+    const hi = attachHand[i];
+    if (hi < 0) continue;
+    const hd = hands[hi];
+    let ax = anchor[3*i], ay = anchor[3*i+1], az = anchor[3*i+2];
+    const al = Math.hypot(ax, ay, az) || 1, s = dep * anchorMask[i] / al;
+    toWorld(hd, ax - ax*s, ay - ay*s, az - az*s);
+    let dx = X[3*i]-W[0], dy = X[3*i+1]-W[1], dz = X[3*i+2]-W[2];
+    let len = Math.sqrt(dx*dx+dy*dy+dz*dz);
+    if (len < 1e-7) continue;
+    if (len > slip) { // past static friction the skin oozes through the fingers, slowly
+      const f = Math.min(len - slip, slideStep) / len, sx = dx*f, sy = dy*f, sz = dz*f, m = hd.m;
+      anchor[3*i]   += (m[0]*sx + m[3]*sy + m[6]*sz) * -hd.side;
+      anchor[3*i+1] += m[1]*sx + m[4]*sy + m[7]*sz;
+      anchor[3*i+2] += m[2]*sx + m[5]*sy + m[8]*sz;
+      dx -= sx; dy -= sy; dz -= sz;
+    }
+    const c = 1 / (1 + a);
+    hd.forceAcc.x += dx*c; hd.forceAcc.y += dy*c; hd.forceAcc.z += dz*c; // reaction on the hand
+    X[3*i] -= dx*c; X[3*i+1] -= dy*c; X[3*i+2] -= dz*c;
+  }
+}
+
+// The dough inside each fist is compacted and carried along with it, so the ends stay bulbous
+// while the free middle draws down into a neck. Each particle remembers where it sits in each
+// hand's frame (FL), weighted by how deep in that fist it is (FW); that memory yields plastically.
+const FL = [new Float32Array(N * 3), new Float32Array(N * 3)], FW = [new Float32Array(N), new Float32Array(N)];
+function resetFist() {
+  for (let h = 0; h < 2; h++) {
+    const side = hands[h].side;
+    for (let i = 0; i < N; i++) {
+      FL[h][3*i] = -side * Q0[3*i]; FL[h][3*i+1] = Q0[3*i+1]; FL[h][3*i+2] = Q0[3*i+2];
+      FW[h][i] = THREE.MathUtils.smoothstep(side * Q0[3*i], P.fistFrom, P.fistTo);
+    }
+  }
+}
+resetFist();
+function solveFist(h) {
+  const k0 = 1 - Math.exp(-P.fistRate * fistHold * h);
+  for (let hi = 0; hi < 2; hi++) {
+    const hd = hands[hi], fl = FL[hi], fw = FW[hi];
+    let fx = 0, fy = 0, fz = 0;
+    for (let i = 0; i < N; i++) {
+      const w = fw[i];
+      if (w <= 0) continue;
+      toWorld(hd, fl[3*i], fl[3*i+1], fl[3*i+2]);
+      const k = k0 * w;
+      const cx = (W[0] - X[3*i]) * k, cy = (W[1] - X[3*i+1]) * k, cz = (W[2] - X[3*i+2]) * k;
+      X[3*i] += cx; X[3*i+1] += cy; X[3*i+2] += cz;
+      fx -= cx; fy -= cy; fz -= cz;
+    }
+    hd.forceAcc.x += fx; hd.forceAcc.y += fy; hd.forceAcc.z += fz;
+  }
+}
+function updateFistMemory(dt) {
+  const kc = 1 - Math.exp(-dt * P.fistYield), kr = 1 - Math.exp(-dt * P.recover);
+  for (let hi = 0; hi < 2; hi++) {
+    const hd = hands[hi], fl = FL[hi], side = hd.side;
+    hd.setSubstep(1);
+    for (let i = 0; i < N; i++) {
+      if (FW[hi][i] <= 0) continue;
+      toLocal(hd, X[3*i], X[3*i+1], X[3*i+2]);
+      fl[3*i] += (L[0] - fl[3*i]) * kc; fl[3*i+1] += (L[1] - fl[3*i+1]) * kc; fl[3*i+2] += (L[2] - fl[3*i+2]) * kc;
+      fl[3*i] += (-side * Q0[3*i] - fl[3*i]) * kr; fl[3*i+1] += (Q0[3*i+1] - fl[3*i+1]) * kr; fl[3*i+2] += (Q0[3*i+2] - fl[3*i+2]) * kr;
+    }
+  }
+}
+
+let releasing = false, fistHold = 1;
+function updateContacts(dt = 1 / 60) {
+  const dep = P.pressDepth * press, relax = 1 - Math.exp(-dt * P.anchorRelax);
+  for (const hd of hands) hd.setSubstep(1);
+  for (let i = 0; i < N; i++) {
+    const hi = attachHand[i];
+    if (hi >= 0) {
+      const hd = hands[hi];
+      let ax = anchor[3*i], ay = anchor[3*i+1], az = anchor[3*i+2];
+      const al = Math.hypot(ax, ay, az) || 1, s = dep * anchorMask[i] / al;
+      if (sdHandCollide(ax - ax*s, ay - ay*s, az - az*s) > 0.22) { attachHand[i] = -1; continue; }
+      // when the hands ease off, skin that has peeled away from the fingers lets go
+      toLocal(hd, X[3*i], X[3*i+1], X[3*i+2]);
+      if (releasing && sdHandCollide(L[0], L[1], L[2]) > 0.04) { attachHand[i] = -1; continue; }
+      // otherwise the skin under a finger slowly re-seats, so no strain stays locked in
+      const ll = Math.hypot(L[0], L[1], L[2]) || 1, su = dep * anchorMask[i] / ll;
+      anchor[3*i] += (L[0] + L[0]*su - ax) * relax; anchor[3*i+1] += (L[1] + L[1]*su - ay) * relax; anchor[3*i+2] += (L[2] + L[2]*su - az) * relax;
+      continue;
+    }
+    for (let h = 0; h < 2; h++) {
+      const hd = hands[h];
+      toLocal(hd, X[3*i], X[3*i+1], X[3*i+2]);
+      if (L[0] > 0.25) continue;
+      if (sdHandCollide(L[0], L[1], L[2]) < 0.02 && nearMask >= 0.5) {
+        const lx = L[0], ly = L[1], lz = L[2], ll = Math.hypot(lx, ly, lz) || 1, s = dep * nearMask / ll;
+        attachHand[i] = h; anchorMask[i] = nearMask;
+        anchor[3*i] = lx + lx*s; anchor[3*i+1] = ly + ly*s; anchor[3*i+2] = lz + lz*s;
+        break;
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Doh rendering + suspended air bubbles
+// ============================================================================
+const GELS = {
+  aqua:  { name: 'Aqua',  color: '#38c6d6', dist: 0.95, swatch: '#7fdbe6' },
+  clear: { name: 'Clear', color: '#d9ecf5', dist: 2.5,  swatch: '#eef6fa' },
+  grape: { name: 'Grape', color: '#9b6bff', dist: 0.8,  swatch: '#b897ff' },
+  lime:  { name: 'Lime',  color: '#8fd94a', dist: 0.9,  swatch: '#b5ea7f' },
+  honey: { name: 'Honey', color: '#ffb13b', dist: 0.85, swatch: '#ffcd7a' },
+};
+const dohMat = new THREE.MeshPhysicalMaterial({
+  color: '#ffffff', roughness: 0.06, metalness: 0, transmission: 1, thickness: 1.6, ior: 1.36,
+  attenuationColor: new THREE.Color(GELS.aqua.color), attenuationDistance: GELS.aqua.dist,
+  clearcoat: 1, clearcoatRoughness: 0.08, specularIntensity: 1, envMapIntensity: 1.25,
+});
+const dohGeo = new THREE.BufferGeometry();
+const posAttr = new THREE.BufferAttribute(X, 3); posAttr.setUsage(THREE.DynamicDrawUsage);
+const NRM = new Float32Array(N * 3);
+const nrmAttr = new THREE.BufferAttribute(NRM, 3); nrmAttr.setUsage(THREE.DynamicDrawUsage);
+dohGeo.setAttribute('position', posAttr);
+dohGeo.setAttribute('normal', nrmAttr);
+dohGeo.setIndex(new THREE.BufferAttribute(TRI, 1));
+const doh = new THREE.Mesh(dohGeo, dohMat);
+doh.castShadow = true; doh.frustumCulled = false;
+scene.add(doh);
+
+function updateNormals() {
+  NRM.fill(0);
+  for (let t = 0; t < NT; t++) {
+    const a = 3*TRI[3*t], b = 3*TRI[3*t+1], c = 3*TRI[3*t+2];
+    const ux = X[b]-X[a], uy = X[b+1]-X[a+1], uz = X[b+2]-X[a+2];
+    const vx = X[c]-X[a], vy = X[c+1]-X[a+1], vz = X[c+2]-X[a+2];
+    const nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+    NRM[a]+=nx; NRM[a+1]+=ny; NRM[a+2]+=nz; NRM[b]+=nx; NRM[b+1]+=ny; NRM[b+2]+=nz; NRM[c]+=nx; NRM[c+1]+=ny; NRM[c+2]+=nz;
+  }
+  for (let i = 0; i < 3*N; i += 3) { const l = Math.hypot(NRM[i], NRM[i+1], NRM[i+2]) || 1; NRM[i]/=l; NRM[i+1]/=l; NRM[i+2]/=l; }
+  posAttr.needsUpdate = true; nrmAttr.needsUpdate = true;
+  dohGeo.computeBoundingSphere();
+}
+
+// bubbles are embedded in the gel: affine fit of the body + local surface residual
+const NB = 22, bubbles = [];
+{
+  let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  while (bubbles.length < NB) {
+    const p = [rnd()*2-1, rnd()*2-1, rnd()*2-1], r = Math.hypot(...p);
+    if (r > 0.82 || r < 0.15) continue;
+    const dir = p.map(x => x / r), near = [];
+    for (let i = 0; i < N; i++) {
+      const d = Math.hypot(Q0[3*i]-dir[0], Q0[3*i+1]-dir[1], Q0[3*i+2]-dir[2]);
+      if (near.length < 6 || d < near[5].d) { near.push({ i, d }); near.sort((a, b) => a.d - b.d); if (near.length > 6) near.pop(); }
+    }
+    const ws = near.map(n => 1 / (n.d + 0.04)), wsum = ws.reduce((a, b) => a + b);
+    const size = 0.012 + rnd() ** 2.5 * 0.055;
+    bubbles.push({ b0: p, f: r * r, near: near.map(n => n.i), w: ws.map(w => w / wsum), size, pos: new THREE.Vector3(...p) });
+  }
+}
+const bubbleMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(1, 18, 12),
+  new THREE.MeshStandardMaterial({ color: '#ffffff', metalness: 1, roughness: 0.06, envMapIntensity: 1.6 }), NB);
+bubbleMesh.frustumCulled = false;
+scene.add(bubbleMesh);
+const _bm = new THREE.Matrix4();
+function updateBubbles(dt) {
+  computeApq(Q0, _Apq); mul3(_Apq, Aqq0Inv, SM.A0);
+  const A = SM.A0, cx = SM.cx, cy = SM.cy, cz = SM.cz;
+  const det = Math.max(0.05, A[0]*(A[4]*A[8]-A[7]*A[5]) - A[3]*(A[1]*A[8]-A[7]*A[2]) + A[6]*(A[1]*A[5]-A[4]*A[2]));
+  const sn = 1 / Math.cbrt(det), k = 1 - Math.exp(-dt * 9);
+  for (let b = 0; b < NB; b++) {
+    const B = bubbles[b], [x, y, z] = B.b0;
+    let tx = cx + A[0]*x + A[3]*y + A[6]*z, ty = cy + A[1]*x + A[4]*y + A[7]*z, tz = cz + A[2]*x + A[5]*y + A[8]*z;
+    let rx = 0, ry = 0, rz = 0;
+    for (let n = 0; n < 6; n++) {
+      const i = B.near[n], w = B.w[n], qx = Q0[3*i], qy = Q0[3*i+1], qz = Q0[3*i+2];
+      rx += w * (X[3*i]   - (cx + A[0]*qx + A[3]*qy + A[6]*qz));
+      ry += w * (X[3*i+1] - (cy + A[1]*qx + A[4]*qy + A[7]*qz));
+      rz += w * (X[3*i+2] - (cz + A[2]*qx + A[5]*qy + A[8]*qz));
+    }
+    tx += rx * B.f; ty += ry * B.f; tz += rz * B.f;
+    B.pos.x += (tx - B.pos.x) * k; B.pos.y += (ty - B.pos.y) * k; B.pos.z += (tz - B.pos.z) * k;
+    const s = B.size, h = 0.5 * sn; // bubbles shear with the gel, but only halfway (surface tension)
+    _bm.set(s*(0.5+h*A[0]), s*h*A[3], s*h*A[6], B.pos.x,
+            s*h*A[1], s*(0.5+h*A[4]), s*h*A[7], B.pos.y,
+            s*h*A[2], s*h*A[5], s*(0.5+h*A[8]), B.pos.z,
+            0, 0, 0, 1);
+    bubbleMesh.setMatrixAt(b, _bm);
+  }
+  bubbleMesh.instanceMatrix.needsUpdate = true;
+}
+
+// ============================================================================
+// Input: lead hand follows the cursor, the other mirrors it through the centre
+// ============================================================================
+const input = { ndc: new THREE.Vector2(0, 0), right: true, down: false, twist: 0, inside: false };
+const raycaster = new THREE.Raycaster(), plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), hit = new THREE.Vector3();
+const canvas = renderer.domElement, leadEl = document.getElementById('lead');
+function onMove(e) {
+  input.ndc.set(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  input.right = e.clientX >= innerWidth / 2;
+  input.inside = true;
+}
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerdown', e => { onMove(e); input.down = true; canvas.classList.add('squeezing'); canvas.setPointerCapture(e.pointerId); });
+addEventListener('pointerup', () => { input.down = false; canvas.classList.remove('squeezing'); });
+canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') input.inside = false; });
+canvas.addEventListener('wheel', e => { e.preventDefault(); input.twist = THREE.MathUtils.clamp(input.twist + e.deltaY * 0.004, -2.0, 2.0); }, { passive: false });
+addEventListener('resize', () => { renderer.setSize(innerWidth, innerHeight); placeCamera(); });
+
+const pull = new THREE.Vector3(), pullSmooth = new THREE.Vector3();
+let twistSmooth = 0;
+function computePull(dt) {
+  if (input.inside) {
+    raycaster.setFromCamera(input.ndc, camera);
+    if (raycaster.ray.intersectPlane(plane, hit)) {
+      const m = Math.hypot(hit.x, hit.y) * P.pullGain;
+      const mm = m > 1e-6 ? P.pullMax * Math.tanh(m / P.pullMax) / m * P.pullGain : 0;
+      pull.set(hit.x * mm, hit.y * mm, 0);
+      if (!input.right) pull.multiplyScalar(-1); // left half: left hand leads, so right hand gets the mirror
+    }
+  } else pull.multiplyScalar(Math.exp(-dt * 3));
+  pullSmooth.lerp(pull, 1 - Math.exp(-dt * 18));
+  input.twist *= Math.exp(-dt * 0.6);
+  twistSmooth += (input.twist - twistSmooth) * (1 - Math.exp(-dt * 8));
+  leadEl.textContent = (input.right ? 'Right' : 'Left') + ' hand leads';
+}
+
+let time = 0, lastPull = 0, pressPeak = 0;
+const _a = new THREE.Vector3(), _target = new THREE.Vector3(), _acc = new THREE.Vector3(), XAX = new THREE.Vector3(1, 0, 0);
+const _qa = new THREE.Quaternion(), _qt = new THREE.Quaternion();
+function updateHands(dt) {
+  const bob = Math.sin(time * 1.25) * 0.05;
+  // hands are force-limited: they pull out briskly but ease back gently, letting the doh lead
+  const om = releasing ? P.handReturn : P.handStiff, ze = releasing ? 1.0 : 0.6;
+  for (const hd of hands) {
+    hd.prevPos.copy(hd.pos); hd.prevRot.copy(hd.rot); hd.prevVel.copy(hd.vel);
+    hd.force.copy(hd.forceAcc).divideScalar(P.substeps);
+    hd.forceAcc.set(0, 0, 0);
+    _target.copy(pullSmooth).multiplyScalar(hd.side); _target.y += bob;
+    // the doh's tension (and weight) drags each hand back toward it
+    const y = _a.copy(hd.force).multiplyScalar(P.handYield);
+    if (y.length() > 0.9) y.setLength(0.9);
+    _target.add(y);
+    _acc.copy(_target).sub(hd.pos).multiplyScalar(om * om).addScaledVector(hd.vel, -2 * ze * om);
+    hd.vel.addScaledVector(_acc, dt); hd.pos.addScaledVector(hd.vel, dt);
+  }
+  // both hands line up along the stretch axis; scroll twists them in opposition
+  _a.set(2, 0, 0).add(hands[1].pos).sub(hands[0].pos).normalize();
+  _qa.setFromUnitVectors(XAX, _a);
+  for (const hd of hands) {
+    _qt.setFromAxisAngle(_a, twistSmooth * hd.side * 1.2).multiply(_qa);
+    hd.rot.slerp(_qt, 1 - Math.exp(-dt * 12));
+  }
+}
+
+function updateHandMeshes(dt) {
+  const dep = P.pressDepth * press, base = handGeo.base, mask = handGeo.mask, jig = handGeo.jig;
+  for (const hd of hands) {
+    // jelly lag: fingers trail the hand's acceleration
+    _acc.copy(hd.vel).sub(hd.prevVel).divideScalar(Math.max(dt, 1e-4));
+    const om = 17, ze = 0.32;
+    hd.Jv.addScaledVector(_acc.multiplyScalar(-0.55).addScaledVector(hd.J, -om*om).addScaledVector(hd.Jv, -2*ze*om), dt);
+    hd.J.addScaledVector(hd.Jv, dt);
+    if (hd.J.length() > 0.25) hd.J.setLength(0.25);
+    _a.copy(hd.J).applyQuaternion(_q.copy(hd.rot).invert());
+    const jx = _a.x * -hd.side, jy = _a.y, jz = _a.z;
+    const arr = hd.mesh.geometry.attributes.position.array;
+    for (let v = 0; v < arr.length; v += 3) {
+      const bx = base[v], by = base[v+1], bz = base[v+2], k = v / 3;
+      const s = dep * mask[k] / (Math.hypot(bx, by, bz) || 1), j = jig[k];
+      arr[v] = bx - bx*s + jx*j; arr[v+1] = by - by*s + jy*j; arr[v+2] = bz - bz*s + jz*j;
+    }
+    hd.mesh.geometry.attributes.position.needsUpdate = true;
+    hd.mesh.position.copy(hd.pos); hd.mesh.quaternion.copy(hd.rot);
+  }
+}
+
+// plastic creep: the remembered shape drifts toward what it's being held as, then recovers
+function updateCreep(dt) {
+  const R = SM.R, kc = 1 - Math.exp(-dt * P.creep), kr = 1 - Math.exp(-dt * P.recover);
+  let mx = 0, my = 0, mz = 0;
+  for (let i = 0; i < N; i++) {
+    const px = X[3*i]-SM.cx, py = X[3*i+1]-SM.cy, pz = X[3*i+2]-SM.cz;
+    const lx = R[0]*px + R[1]*py + R[2]*pz, ly = R[3]*px + R[4]*py + R[5]*pz, lz = R[6]*px + R[7]*py + R[8]*pz;
+    let qx = Q[3*i] + (lx - Q[3*i]) * kc, qy = Q[3*i+1] + (ly - Q[3*i+1]) * kc, qz = Q[3*i+2] + (lz - Q[3*i+2]) * kc;
+    qx += (Q0[3*i] - qx) * kr; qy += (Q0[3*i+1] - qy) * kr; qz += (Q0[3*i+2] - qz) * kr;
+    Q[3*i] = qx; Q[3*i+1] = qy; Q[3*i+2] = qz; mx += qx; my += qy; mz += qz;
+  }
+  mx /= N; my /= N; mz /= N;
+  for (let i = 0; i < N; i++) { Q[3*i] -= mx; Q[3*i+1] -= my; Q[3*i+2] -= mz; }
+  computeAqqInv(Q, AqqInv);
+}
+
+function physicsStep(dt) {
+  const S = P.substeps, h = dt / S, h2 = h * h;
+  const g = P.gravity * h, visc = 1 - Math.exp(-P.viscosity * h), damp = Math.exp(-P.damping * h);
+  const shapeK = 1 - Math.exp(-P.shapeRate * h);
+  for (let s = 0; s < S; s++) {
+    const t = (s + 1) / S;
+    for (const hd of hands) hd.setSubstep(t);
+    for (let i = 0; i < 3*N; i += 3) {
+      Vel[i+1] += g;
+      Xp[i] = X[i]; Xp[i+1] = X[i+1]; Xp[i+2] = X[i+2];
+      X[i] += Vel[i]*h; X[i+1] += Vel[i+1]*h; X[i+2] += Vel[i+2]*h;
+    }
+    solveEdges(h2);
+    solveBends(h2);
+    shapeMatch(shapeK);
+    solveFist(h);
+    solveGrip(h2, s === S - 1);
+    solveCollisions();
+    solveEdges(h2); // second skin pass so the grip can't concentrate strain into a few edges
+    solveVolume(h2);
+    clampStrain();
+    const inv = 1 / h;
+    for (let i = 0; i < 3*N; i++) Vel[i] = (X[i] - Xp[i]) * inv * damp;
+    applyViscosity(visc);
+  }
+}
+
+// ============================================================================
+// Loop
+// ============================================================================
+let last = performance.now(), paused = false, fpsAvg = 60;
+function frame(now) {
+  const dt = Math.min(Math.max((now - last) / 1000, 1 / 240), 1 / 30);
+  last = now;
+  if (!paused) tick(dt);
+  renderer.render(scene, camera);
+  fpsAvg += (1 / Math.max(dt, 1e-3) - fpsAvg) * 0.05;
+  requestAnimationFrame(frame);
+}
+function tick(dt) {
+  time += dt;
+  computePull(dt);
+  // people clench harder the further they pull, so pulling alone closes the fingers part-way
+  const clench = Math.min(pullSmooth.length() / P.pullMax, 1) * P.pullClench;
+  const pressTarget = Math.max(input.down ? 1 : 0, clench);
+  press += (pressTarget - press) * (1 - Math.exp(-dt * (pressTarget > press ? 7 : 2.5)));
+  // easing off (pull shrinking or squeeze letting go): grip loosens so the doh recovers on its own
+  const pl = pullSmooth.length();
+  releasing = pl < lastPull - 0.002 * 60 * dt || pressTarget < press - 0.02;
+  lastPull = pl;
+  pressPeak = Math.max(pressPeak, press);
+  if (pressPeak > 0.3 && press < 0.04) { attachHand.fill(-1); pressPeak = 0; } // fingers re-seat on the relaxed skin
+  fistHold += ((releasing ? 0.25 : 1) - fistHold) * (1 - Math.exp(-dt * (releasing ? 6 : 2)));
+  displacePrims(P.pressDepth * press);
+  updateHands(dt);
+  physicsStep(dt);
+  updateCreep(dt);
+  updateFistMemory(dt);
+  updateContacts(dt);
+  updateNormals();
+  updateBubbles(dt);
+  updateHandMeshes(dt);
+}
+// settle the grip before the first frame
+for (const hd of hands) { hd.setSubstep(1); }
+updateContacts();
+for (let i = 0; i < 30; i++) tick(1 / 60);
+requestAnimationFrame(frame);
+
+// ============================================================================
+// UI: gel colours + hidden tuner (press T)
+// ============================================================================
+const sw = document.getElementById('swatches');
+for (const [k, g] of Object.entries(GELS)) {
+  const b = document.createElement('button');
+  b.style.background = g.swatch; b.title = g.name + ' gel'; b.setAttribute('aria-label', g.name + ' gel');
+  if (k === 'aqua') b.classList.add('on');
+  b.onclick = () => {
+    dohMat.attenuationColor.set(g.color); dohMat.attenuationDistance = g.dist;
+    sw.querySelectorAll('button').forEach(x => x.classList.remove('on')); b.classList.add('on');
+  };
+  sw.appendChild(b);
+}
+const tuner = document.getElementById('tuner');
+for (const k of Object.keys(P)) {
+  if (k === 'substeps') continue;
+  const v0 = P[k], lab = document.createElement('label'), inp = document.createElement('input'), out = document.createElement('span');
+  inp.type = 'range'; inp.min = 0; inp.max = 1000; inp.step = 1;
+  const lo = v0 < 0 ? v0 * 3 : 0, hi = v0 < 0 ? 0 : (v0 === 0 ? 1e-4 : v0 * 3);
+  inp.value = (v0 - lo) / (hi - lo) * 1000;
+  out.textContent = (+v0).toPrecision(3);
+  inp.oninput = () => { P[k] = lo + (hi - lo) * inp.value / 1000; out.textContent = P[k].toPrecision(3); };
+  lab.append(k, inp, out); tuner.appendChild(lab);
+}
+addEventListener('keydown', e => { if (e.key === 't' || e.key === 'T') tuner.style.display = tuner.style.display === 'block' ? 'none' : 'block'; });
+
+// debug / test hooks
+window.__sim = {
+  P, hands, input, X, N,
+  get press() { return press; }, get fps() { return fpsAvg; },
+  setCursor(fx, fy, down = false) { // fractions of the viewport, 0..1
+    input.ndc.set(fx * 2 - 1, -(fy * 2 - 1)); input.right = fx >= 0.5; input.inside = true; input.down = down;
+  },
+  reset() {
+    X.set(Q0); Q.set(Q0); Vel.fill(0); attachHand.fill(-1); computeAqqInv(Q, AqqInv); smQuat.identity();
+    for (const hd of hands) { hd.pos.set(0, 0, 0); hd.vel.set(0, 0, 0); hd.rot.identity(); hd.prevPos.set(0, 0, 0); hd.prevRot.identity(); hd.force.set(0, 0, 0); hd.setSubstep(1); }
+    resetFist(); releasing = false; fistHold = 1; lastPull = 0; pressPeak = 0;
+    pull.set(0, 0, 0); pullSmooth.set(0, 0, 0); input.twist = 0; twistSmooth = 0; input.down = false; press = 0; displacePrims(0);
+    updateContacts();
+  },
+  run(seconds) { const p = paused; paused = true; for (let t = 0; t < seconds; t += 1/60) tick(1/60); renderer.render(scene, camera); paused = p; },
+  pause(v) { paused = v; },
+  stats() {
+    let mnx = 1e9, mxx = -1e9, mny = 1e9, mxy = -1e9, attached = 0;
+    for (let i = 0; i < N; i++) { mnx = Math.min(mnx, X[3*i]); mxx = Math.max(mxx, X[3*i]); mny = Math.min(mny, X[3*i+1]); mxy = Math.max(mxy, X[3*i+1]); if (attachHand[i] >= 0) attached++; }
+    let maxStrain = 0;
+    for (let e = 0; e < NE; e++) { const i = 3*EDGE[2*e], j = 3*EDGE[2*e+1]; maxStrain = Math.max(maxStrain, Math.hypot(X[j]-X[i], X[j+1]-X[i+1], X[j+2]-X[i+2]) / EREST[e] - 1); }
+    return { width: +(mxx - mnx).toFixed(3), height: +(mxy - mny).toFixed(3), vol: +(meshVolume() / V0).toFixed(4), attached, maxStrain: +maxStrain.toFixed(3),
+      handL: hands[0].pos.toArray().map(v => +v.toFixed(2)), handR: hands[1].pos.toArray().map(v => +v.toFixed(2)), fps: Math.round(fpsAvg) };
+  },
+};
+</script>
+</body>
+</html>
